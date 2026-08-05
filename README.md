@@ -26,6 +26,34 @@ overwriting what jellyfin_popfeed already tracked — see
 pip install -e .
 ```
 
+## Configuration
+
+**Do this before anything else** — copy `.env.example` to `.env` in
+whatever directory you'll run `simkl-popfeed` from, and set at least
+`SIMKL_CLIENT_ID` (from the Simkl app you registered). `--setup` below
+reads `SIMKL_CLIENT_ID` from this file; without it, `--setup` fails
+immediately with "SIMKL_CLIENT_ID is not set".
+
+```bash
+cp .env.example .env
+```
+
+| Variable                                 | Required | Description                                                          |
+| ----------------------------------------- | -------- | ---------------------------------------------------------------------|
+| `SIMKL_CLIENT_ID`                         | Yes      | Simkl API application client ID — set this first                     |
+| `SIMKL_ACCESS_TOKEN`                      | Yes      | Access token from `simkl-popfeed --setup` (see below) — leave the placeholder until you've run it |
+| `POPFEED_IDENTIFIER`                      | Yes      | Your Popfeed handle (e.g. `you.bsky.social`)                         |
+| `POPFEED_PASSWORD`                        | Yes      | App password                                                         |
+| `POPFEED_PDS_URL`                         | No       | PDS URL (default: `https://eurosky.social`)                          |
+| `SIMKL_POPFEED_WATCHED_MOVIES_LIST_NAME`  | No       | Override the "Watched Movies" list name                              |
+| `SIMKL_POPFEED_WATCHED_SHOWS_LIST_NAME`   | No       | Override the "Watched Shows" list name                               |
+| `SIMKL_POPFEED_RECENT_LIST_NAME`          | No       | Override the "Recent" list name                                      |
+| `DRY_RUN`                                 | No       | Set to `true` to log without writing                                 |
+
+Only `SIMKL_CLIENT_ID` needs to be real before the next step —
+`POPFEED_IDENTIFIER`/`POPFEED_PASSWORD` can stay as placeholders until
+you're ready to actually run the sync.
+
 ## One-time setup: get a Simkl access token
 
 Simkl uses a PIN/device-code flow — no OAuth redirect server needed:
@@ -35,28 +63,9 @@ simkl-popfeed --setup
 ```
 
 This prints a URL and a code; approve it in a browser, and the command
-prints a long-lived (~5 year) access token to save. Copy it into `.env` as
-`SIMKL_ACCESS_TOKEN`, or into a GitHub Actions secret for the daily cron.
-
-## Configuration
-
-Copy `.env.example` to `.env` and fill in the values:
-
-```bash
-cp .env.example .env
-```
-
-| Variable                                 | Required | Description                                                          |
-| ----------------------------------------- | -------- | ---------------------------------------------------------------------|
-| `SIMKL_CLIENT_ID`                         | Yes      | Simkl API application client ID                                      |
-| `SIMKL_ACCESS_TOKEN`                      | Yes      | Access token from `simkl-popfeed --setup`                            |
-| `POPFEED_IDENTIFIER`                      | Yes      | Your Popfeed handle (e.g. `you.bsky.social`)                         |
-| `POPFEED_PASSWORD`                        | Yes      | App password                                                         |
-| `POPFEED_PDS_URL`                         | No       | PDS URL (default: `https://eurosky.social`)                          |
-| `SIMKL_POPFEED_WATCHED_MOVIES_LIST_NAME`  | No       | Override the "Watched Movies" list name                              |
-| `SIMKL_POPFEED_WATCHED_SHOWS_LIST_NAME`   | No       | Override the "Watched Shows" list name                               |
-| `SIMKL_POPFEED_RECENT_LIST_NAME`          | No       | Override the "Recent" list name                                      |
-| `DRY_RUN`                                 | No       | Set to `true` to log without writing                                 |
+prints a long-lived (~5 year) access token. Paste it into `.env` as
+`SIMKL_ACCESS_TOKEN` (replacing the placeholder), and also save it as a
+GitHub Actions secret for the daily cron.
 
 ## Usage
 

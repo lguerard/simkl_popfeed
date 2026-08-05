@@ -134,7 +134,14 @@ class SimklClient:
         result = data.get("result")
         if result == "OK" and data.get("access_token"):
             return data["access_token"]
+        # Simkl returns result: "KO" with message "Authorization pending"
+        # as the normal "not approved yet" response while polling, not a
+        # real failure — only treat KO as fatal once the message says
+        # otherwise (e.g. the PIN expired or the user denied it).
         if result == "KO":
+            message = str(data.get("message", "")).lower()
+            if "pending" in message:
+                raise SimklAuthPending()
             raise SimklError(f"PIN flow failed: {data}")
         raise SimklAuthPending()
 
