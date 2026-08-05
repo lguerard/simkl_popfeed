@@ -5,10 +5,18 @@ or a "wait for Ns" body pattern, else exponential backoff).
 Run directly: python tests/test_atproto_retry.py
 """
 
+import time
+
 import httpx
 
 import simkl_popfeed.atproto as atproto_module
-from simkl_popfeed.atproto import AtProtoClient, _is_retryable, _retry_delay
+from simkl_popfeed.atproto import (
+    AtProtoClient,
+    AtProtoSession,
+    _MIN_REQUEST_INTERVAL_SECONDS,
+    _is_retryable,
+    _retry_delay,
+)
 
 
 def test_is_retryable_covers_429_and_5xx_only() -> None:
@@ -63,10 +71,31 @@ def test_client_retries_429_then_succeeds() -> None:
     assert session.did == "did:plc:fake"
 
 
+def test_requests_are_paced_to_avoid_bursting_the_rate_limit() -> None:
+    call_times: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_times.append(time.monotonic())
+        return httpx.Response(200, json={"records": []})
+
+    client = AtProtoClient("https://example.test")
+    client._http = httpx.Client(transport=httpx.MockTransport(handler))
+    client._session = AtProtoSession(
+        did="did:plc:fake", handle="x", access_jwt="y", pds_url="https://example.test"
+    )
+
+    client.list_records(did="did:plc:fake", collection="social.popfeed.feed.listItem")
+    client.list_records(did="did:plc:fake", collection="social.popfeed.feed.listItem")
+
+    assert len(call_times) == 2
+    assert call_times[1] - call_times[0] >= _MIN_REQUEST_INTERVAL_SECONDS - 0.01
+
+
 if __name__ == "__main__":
     test_is_retryable_covers_429_and_5xx_only()
     test_retry_delay_prefers_retry_after_seconds_header()
     test_retry_delay_falls_back_to_wait_for_pattern_in_body()
     test_retry_delay_falls_back_to_exponential_backoff()
     test_client_retries_429_then_succeeds()
+    test_requests_are_paced_to_avoid_bursting_the_rate_limit()
     print("ok")

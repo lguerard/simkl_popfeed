@@ -22,6 +22,17 @@ _SESSION_COLLECTION_LIMIT = 100
 _MAX_REQUEST_ATTEMPTS = 6
 _WAIT_FOR_RE = re.compile(r"wait\s+for\s+(\d+)\s*s", re.IGNORECASE)
 
+# jellyfin_popfeed never needed request pacing since it writes one item at a
+# time as things get watched, spread out naturally over real usage. Bulk
+# scripts (scripts/fix_legacy_status.py rewriting hundreds of records, or
+# iter_all_records paginating a large collection) fire requests back to back
+# with no gap at all otherwise, which trips a PDS's rate limit before a
+# single write even gets a chance to succeed — retries alone don't recover
+# from that fast enough. Spacing every request out by this much keeps
+# bulk operations under typical PDS limits so the 429 path is a rare
+# fallback instead of the normal outcome of a large run.
+_MIN_REQUEST_INTERVAL_SECONDS = 0.25
+
 
 def _is_record_not_found(response: httpx.Response) -> bool:
     """Return True when a response means "record does not exist".
@@ -142,6 +153,7 @@ class AtProtoClient:
         self._pds_url = pds_url.rstrip("/")
         self._http = httpx.Client(timeout=30.0)
         self._session: Optional[AtProtoSession] = None
+        self._last_request_at: float = 0.0
 
     def close(self) -> None:
         """Close the underlying HTTP client."""
@@ -194,15 +206,24 @@ class AtProtoClient:
                 message = response.text[:200]
             raise AtProtoError(f"XRPC error {response.status_code}: {message}")
 
+    def _pace(self) -> None:
+        """Block until at least ``_MIN_REQUEST_INTERVAL_SECONDS`` has
+        passed since the previous request, to avoid bursting a PDS's
+        rate limit in the first place."""
+        elapsed = time.monotonic() - self._last_request_at
+        remaining = _MIN_REQUEST_INTERVAL_SECONDS - elapsed
+        if remaining > 0:
+            time.sleep(remaining)
+
     def _send_with_retries(
         self, send: Callable[[], httpx.Response], operation: str
     ) -> httpx.Response:
-        """Send a request, retrying transient failures with backoff.
+        """Send a request, pacing it and retrying transient failures.
 
         Returns the response as-is on success OR on a non-retryable error
         (404s from a missing record, 400s, etc.) — callers keep doing their
         own success/error handling on the result exactly as before; this
-        only adds a retry loop around 429/5xx responses.
+        only adds pacing plus a retry loop around 429/5xx responses.
 
         Parameters:
             send (Callable[[], httpx.Response]): Issues one HTTP request.
@@ -219,10 +240,13 @@ class AtProtoClient:
                 handling instead, same as before retries existed.
         """
         for attempt in range(1, _MAX_REQUEST_ATTEMPTS + 1):
+            self._pace()
             try:
                 response = send()
             except httpx.RequestError as exc:
+                self._last_request_at = time.monotonic()
                 raise AtProtoError(f"{operation} request failed: {exc}") from exc
+            self._last_request_at = time.monotonic()
 
             if response.is_success or not _is_retryable(response.status_code):
                 return response
