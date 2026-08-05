@@ -29,6 +29,15 @@ _COLLECTION_LIST = "social.popfeed.feed.list"
 _COLLECTION_LIST_ITEM = "social.popfeed.feed.listItem"
 _COLLECTION_REVIEW = "social.popfeed.feed.review"
 
+# Popfeed's actual accepted status values (confirmed against
+# jellyfin_popfeed's PopfeedListItemRecord.FinishedStatus/InProgressStatus
+# in its C# source — these are literal strings including the "#", not
+# bare words. Writing "finished" instead of "#finished" doesn't error
+# (ATProto doesn't validate token values against the lexicon on write),
+# it just silently doesn't register as watched in the Popfeed app.
+_STATUS_FINISHED = "#finished"
+_STATUS_IN_PROGRESS = "#in_progress"
+
 # Matches jellyfin_popfeed's default list names/types (PopfeedWatchedListWriter).
 _LIST_NAMES: dict[str, str] = {
     "watched_movies": "Watched Movies",
@@ -329,21 +338,20 @@ class PopfeedClient:
             "listType": item.list_type,
             "creativeWorkType": item.creative_work_type,
             "identifiers": identifiers,
-            "status": "finished",
+            "status": _STATUS_FINISHED,
             "addedAt": watched_at,
             "completedAt": watched_at,
-            "updatedAt": now,
             "title": item.title,
         }
         recent_record = {
             "$type": _COLLECTION_LIST_ITEM,
             "listUri": list_uris["recent"],
+            "listType": "recent",
             "creativeWorkType": item.creative_work_type,
             "identifiers": identifiers,
-            "status": "finished",
+            "status": _STATUS_FINISHED,
             "addedAt": watched_at,
             "completedAt": watched_at,
-            "updatedAt": now,
             "title": item.title,
         }
 
