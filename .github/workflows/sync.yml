@@ -1,0 +1,29 @@
+name: Sync Simkl → Popfeed
+
+on:
+    schedule:
+        - cron: "0 6 * * *" # once daily
+    workflow_dispatch: # manual trigger
+
+jobs:
+    sync:
+        runs-on: ubuntu-latest
+
+        steps:
+            - uses: actions/checkout@v4
+
+            - uses: actions/setup-python@v5
+              with:
+                  python-version: "3.11"
+
+            - name: Install dependencies
+              run: pip install -e .
+
+            - name: Run sync
+              run: simkl-popfeed
+              env:
+                  SIMKL_CLIENT_ID: ${{ secrets.SIMKL_CLIENT_ID }}
+                  SIMKL_ACCESS_TOKEN: ${{ secrets.SIMKL_ACCESS_TOKEN }}
+                  POPFEED_IDENTIFIER: ${{ secrets.POPFEED_IDENTIFIER }}
+                  POPFEED_PASSWORD: ${{ secrets.POPFEED_PASSWORD }}
+                  POPFEED_PDS_URL: ${{ vars.POPFEED_PDS_URL }}
