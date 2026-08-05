@@ -1,13 +1,26 @@
 """AT Protocol XRPC client."""
 
 import logging
-from typing import Any, Iterator, Optional
+import re
+import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from typing import Any, Callable, Iterator, Optional
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
 _SESSION_COLLECTION_LIMIT = 100
+
+# Retry behaviour matches jellyfin_popfeed's PopfeedAtProtoClient.SendWithRetriesAsync
+# exactly: up to 6 attempts, retrying on 429/5xx, honoring a Retry-After header
+# (seconds or HTTP-date) or a "wait for Ns" pattern in the error body, falling
+# back to exponential backoff capped at 60s. Needed because a large batch (e.g.
+# scripts/fix_legacy_status.py rewriting hundreds of records) reliably hits the
+# PDS's rate limit partway through otherwise.
+_MAX_REQUEST_ATTEMPTS = 6
+_WAIT_FOR_RE = re.compile(r"wait\s+for\s+(\d+)\s*s", re.IGNORECASE)
 
 
 def _is_record_not_found(response: httpx.Response) -> bool:
@@ -31,6 +44,51 @@ def _is_record_not_found(response: httpx.Response) -> bool:
         except Exception:
             return False
     return False
+
+
+def _is_retryable(status_code: int) -> bool:
+    """Return True for transient errors worth retrying (429, 5xx)."""
+    return status_code == 429 or status_code >= 500
+
+
+def _retry_delay(response: httpx.Response, attempt: int) -> float:
+    """Work out how long to wait before retrying a rate-limited/5xx request.
+
+    Tries, in order: the ``Retry-After`` header (seconds or HTTP-date), a
+    "wait for Ns" pattern in the response body (seen in some PDS rate-limit
+    messages), then exponential backoff (``2**attempt``, capped at 60s).
+
+    Parameters:
+        response (httpx.Response): The failed response.
+        attempt (int): The attempt number that just failed (1-indexed).
+
+    Returns:
+        float: Seconds to wait before the next attempt.
+    """
+    retry_after = response.headers.get("retry-after", "").strip()
+    if retry_after:
+        if retry_after.isdigit():
+            seconds = int(retry_after)
+            if seconds > 0:
+                return seconds
+        else:
+            try:
+                retry_at = parsedate_to_datetime(retry_after)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                delta = (retry_at - datetime.now(timezone.utc)).total_seconds()
+                if delta > 0:
+                    return delta
+            except (TypeError, ValueError):
+                pass
+
+    match = _WAIT_FOR_RE.search(response.text)
+    if match:
+        seconds = int(match.group(1))
+        if seconds > 0:
+            return seconds + 1
+
+    return min(60, 2**attempt)
 
 
 class AtProtoError(Exception):
@@ -136,6 +194,54 @@ class AtProtoClient:
                 message = response.text[:200]
             raise AtProtoError(f"XRPC error {response.status_code}: {message}")
 
+    def _send_with_retries(
+        self, send: Callable[[], httpx.Response], operation: str
+    ) -> httpx.Response:
+        """Send a request, retrying transient failures with backoff.
+
+        Returns the response as-is on success OR on a non-retryable error
+        (404s from a missing record, 400s, etc.) — callers keep doing their
+        own success/error handling on the result exactly as before; this
+        only adds a retry loop around 429/5xx responses.
+
+        Parameters:
+            send (Callable[[], httpx.Response]): Issues one HTTP request.
+            operation (str): XRPC method name, for logging.
+
+        Returns:
+            httpx.Response: The final response.
+
+        Raises:
+            AtProtoError: On a network-level failure. A persistent 429/5xx
+                that survives every retry is NOT raised here — it's
+                returned like any other response, and surfaces through
+                the caller's normal ``_raise_for_error``/not-found
+                handling instead, same as before retries existed.
+        """
+        for attempt in range(1, _MAX_REQUEST_ATTEMPTS + 1):
+            try:
+                response = send()
+            except httpx.RequestError as exc:
+                raise AtProtoError(f"{operation} request failed: {exc}") from exc
+
+            if response.is_success or not _is_retryable(response.status_code):
+                return response
+            if attempt == _MAX_REQUEST_ATTEMPTS:
+                return response
+
+            delay = _retry_delay(response, attempt)
+            logger.warning(
+                "ATProto %s failed with %d on attempt %d/%d. Waiting %.0fs before retry.",
+                operation,
+                response.status_code,
+                attempt,
+                _MAX_REQUEST_ATTEMPTS,
+                delay,
+            )
+            time.sleep(delay)
+
+        raise AssertionError("unreachable")  # loop always returns above
+
     def create_session(self, identifier: str, password: str) -> AtProtoSession:
         """Authenticate and store a session.
 
@@ -150,13 +256,12 @@ class AtProtoClient:
             AtProtoError: On authentication failure.
         """
         url = f"{self._pds_url}/xrpc/com.atproto.server.createSession"
-        try:
-            response = self._http.post(
-                url,
-                json={"identifier": identifier, "password": password},
-            )
-        except httpx.RequestError as exc:
-            raise AtProtoError(f"Session request failed: {exc}") from exc
+        response = self._send_with_retries(
+            lambda: self._http.post(
+                url, json={"identifier": identifier, "password": password}
+            ),
+            "createSession",
+        )
         self._raise_for_error(response)
         data: dict = response.json()
         self._session = AtProtoSession(
@@ -197,14 +302,10 @@ class AtProtoClient:
         }
         if cursor:
             params["cursor"] = cursor
-        try:
-            response = self._http.get(
-                url,
-                params=params,
-                headers=self._auth_headers(),
-            )
-        except httpx.RequestError as exc:
-            raise AtProtoError(f"listRecords request failed: {exc}") from exc
+        response = self._send_with_retries(
+            lambda: self._http.get(url, params=params, headers=self._auth_headers()),
+            "listRecords",
+        )
         self._raise_for_error(response)
         return response.json()
 
@@ -247,18 +348,14 @@ class AtProtoClient:
             AtProtoError: On request failure.
         """
         url = f"{self._pds_url}/xrpc/com.atproto.repo.createRecord"
-        try:
-            response = self._http.post(
+        response = self._send_with_retries(
+            lambda: self._http.post(
                 url,
-                json={
-                    "repo": did,
-                    "collection": collection,
-                    "record": record,
-                },
+                json={"repo": did, "collection": collection, "record": record},
                 headers=self._auth_headers(),
-            )
-        except httpx.RequestError as exc:
-            raise AtProtoError(f"createRecord request failed: {exc}") from exc
+            ),
+            "createRecord",
+        )
         self._raise_for_error(response)
         return response.json()
 
@@ -286,14 +383,10 @@ class AtProtoClient:
         """
         url = f"{self._pds_url}/xrpc/com.atproto.repo.getRecord"
         params = {"repo": did, "collection": collection, "rkey": rkey}
-        try:
-            response = self._http.get(
-                url,
-                params=params,
-                headers=self._auth_headers(),
-            )
-        except httpx.RequestError as exc:
-            raise AtProtoError(f"getRecord request failed: {exc}") from exc
+        response = self._send_with_retries(
+            lambda: self._http.get(url, params=params, headers=self._auth_headers()),
+            "getRecord",
+        )
         if _is_record_not_found(response):
             return None
         self._raise_for_error(response)
@@ -311,14 +404,14 @@ class AtProtoClient:
             AtProtoError: On request failure other than a missing record.
         """
         url = f"{self._pds_url}/xrpc/com.atproto.repo.deleteRecord"
-        try:
-            response = self._http.post(
+        response = self._send_with_retries(
+            lambda: self._http.post(
                 url,
                 json={"repo": did, "collection": collection, "rkey": rkey},
                 headers=self._auth_headers(),
-            )
-        except httpx.RequestError as exc:
-            raise AtProtoError(f"deleteRecord request failed: {exc}") from exc
+            ),
+            "deleteRecord",
+        )
         if _is_record_not_found(response):
             return
         self._raise_for_error(response)
@@ -339,8 +432,8 @@ class AtProtoClient:
             AtProtoError: On request failure.
         """
         url = f"{self._pds_url}/xrpc/com.atproto.repo.putRecord"
-        try:
-            response = self._http.post(
+        response = self._send_with_retries(
+            lambda: self._http.post(
                 url,
                 json={
                     "repo": did,
@@ -349,8 +442,8 @@ class AtProtoClient:
                     "record": record,
                 },
                 headers=self._auth_headers(),
-            )
-        except httpx.RequestError as exc:
-            raise AtProtoError(f"putRecord request failed: {exc}") from exc
+            ),
+            "putRecord",
+        )
         self._raise_for_error(response)
         return response.json()
