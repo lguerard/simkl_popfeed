@@ -2,6 +2,7 @@
 
 import os
 from dataclasses import dataclass, field
+from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -39,6 +40,11 @@ class Config:
         list_names (dict[str, str]): Overrides for Watched Movies/Shows/
             Recent list display names, keyed by list type.
         dry_run (bool): If True, log actions without writing to Popfeed.
+        tmdb_api_key (Optional[str]): TMDb API key. When set, seasons and
+            series get marked complete on Popfeed once every episode is
+            watched (needs TMDb for total episode counts, since neither
+            Simkl nor Popfeed expose those). When unset, this step is
+            skipped entirely — everything else still works.
     """
 
     simkl_client_id: str
@@ -48,6 +54,7 @@ class Config:
     popfeed_pds_url: str = "https://eurosky.social"
     list_names: dict = field(default_factory=dict)
     dry_run: bool = False
+    tmdb_api_key: Optional[str] = None
 
     @classmethod
     def from_env(cls, env_file: str = ".env", dry_run: bool = False) -> "Config":
@@ -109,4 +116,5 @@ class Config:
             popfeed_pds_url=_ensure_https(raw_pds_url),
             list_names=list_names,
             dry_run=resolved_dry_run,
+            tmdb_api_key=os.environ.get("TMDB_API_KEY", "").strip() or None,
         )

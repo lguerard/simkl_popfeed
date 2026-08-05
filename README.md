@@ -55,6 +55,7 @@ cp .env.example .env
 | `SIMKL_POPFEED_WATCHED_SHOWS_LIST_NAME`   | No       | Override the "Watched Shows" list name                               |
 | `SIMKL_POPFEED_RECENT_LIST_NAME`          | No       | Override the "Recent" list name                                      |
 | `DRY_RUN`                                 | No       | Set to `true` to log without writing                                 |
+| `TMDB_API_KEY`                            | No       | Free [TMDb API key](https://www.themoviedb.org/settings/api) — enables season/series completion marking (see below) |
 
 Only `SIMKL_CLIENT_ID` needs to be real before the next step —
 `POPFEED_IDENTIFIER`/`POPFEED_PASSWORD` can stay as placeholders until
@@ -106,10 +107,21 @@ simkl-popfeed --env-file /path/to/.env
    lists — **by name**, so it reuses the exact lists jellyfin_popfeed
    already created instead of making duplicates.
 4. For each watched movie/episode, writes a `social.popfeed.feed.listItem`
-   record (plus a Recent-list entry, and a rating-only
-   `social.popfeed.feed.review` record if Simkl has a rating for it —
-   Simkl's comments/review-text API isn't available yet), unless it's
-   already tracked.
+   record with `status: "#finished"` (plus a Recent-list entry, and a
+   rating-only `social.popfeed.feed.review` record if Simkl has a rating
+   for it — Simkl's comments/review-text API isn't available yet), unless
+   it's already tracked.
+5. **If `TMDB_API_KEY` is set**: for every show with at least one watched
+   episode, looks up each season's total episode count from TMDb (one
+   call per show — Simkl/Popfeed only ever expose what's been watched,
+   never the total) and marks a season complete
+   (`social.popfeed.feed.listItem`, `creativeWorkType: "tv_season"`) once
+   every one of its episodes is watched, and the series complete
+   (`creativeWorkType: "tv_show"`) once every season is — matching
+   jellyfin_popfeed's own completion logic exactly, down to the record
+   shapes and rkeys (`w.ts.{seriesId}.{season}` / `w.tv.{seriesId}`), so a
+   show tracked partly via Jellyfin and partly via Simkl still completes
+   correctly either way. Skipped entirely if `TMDB_API_KEY` isn't set.
 
 ## How dedup works
 
@@ -159,9 +171,9 @@ using this flag.
 
 ## Limitations
 
-- **No per-show/season progress records.** Only per-episode watched
-  markers are written, not jellyfin_popfeed's aggregate show/season
-  progress records.
+- **Season/series completion needs `TMDB_API_KEY`.** Without it, only
+  per-episode watched markers are written — the aggregate show/season
+  progress records are skipped entirely.
 - **No review text.** Simkl's reviews/comments API is documented but not
   yet available — review records carry a rating only.
 - **Episode-level TMDb ID coverage isn't guaranteed.** Simkl resolves
@@ -184,6 +196,7 @@ repository secrets/variables:
 - `secrets.POPFEED_IDENTIFIER`
 - `secrets.POPFEED_PASSWORD`
 - `vars.POPFEED_PDS_URL` (optional)
+- `secrets.TMDB_API_KEY` (optional — enables season/series completion)
 
 No Jellyfin-reachability considerations here — this sync only ever talks
-to Popfeed and Simkl, both reachable from GitHub's hosted runners.
+to Popfeed, Simkl, and TMDb, all reachable from GitHub's hosted runners.

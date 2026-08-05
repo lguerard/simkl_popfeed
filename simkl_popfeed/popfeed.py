@@ -7,12 +7,16 @@ deterministic rkey is what makes cross-source dedup possible without any
 shared state: whichever source gets there first "owns" the record, and the
 other leaves it untouched forever after.
 
-ponytail: this module only tracks per-episode watched markers (``w.ep.*``),
-not jellyfin_popfeed's aggregate per-show/per-season progress records
-(``w.tv.*`` / ``w.ts.*``) — those aren't needed for "don't duplicate what
-Jellyfin already tracked", and their exact schema wasn't part of what this
-sync needs to reproduce. Upgrade path: add them the same way if per-show
-progress ever needs to be visible from Simkl-only data.
+Also tracks jellyfin_popfeed's aggregate per-show/per-season progress
+records (``w.tv.{seriesId}`` / ``w.ts.{seriesId}.{season}``), so a season
+gets marked complete once every one of its episodes is watched, and a
+series once every season is — mirroring
+``PopfeedWatchedListWriter.ReconcileSeasonMarkerAsync``/
+``UpsertTvShowProgressAsync`` in jellyfin_popfeed's C# source exactly,
+including the field-shape quirk where the ``tv_show`` record's identity
+lives under ``identifiers.tmdbId`` (not ``tmdbTvSeriesId``, unlike every
+other TV record in this scheme) — that's what the reference
+implementation does, so it's what interop requires here too.
 """
 
 import logging
@@ -92,6 +96,16 @@ def _recent_rkey(id_key: str) -> str:
 def _review_rkey(id_key: str) -> str:
     """Deterministic rkey for a review record, shared with jellyfin_popfeed."""
     return f"rv.{id_key}"
+
+
+def _tv_show_rkey(show_tmdb_id: int) -> str:
+    """Deterministic rkey for a show's progress record (PopfeedRkeyBuilder.ForTvShowProgress)."""
+    return f"w.tv.{show_tmdb_id}"
+
+
+def _tv_season_rkey(show_tmdb_id: int, season: int) -> str:
+    """Deterministic rkey for a completed-season marker (PopfeedRkeyBuilder.ForTvSeason)."""
+    return f"w.ts.{show_tmdb_id}.{season}"
 
 
 def _now_iso() -> str:
@@ -419,6 +433,166 @@ class PopfeedClient:
             collection=_COLLECTION_REVIEW,
             rkey=_review_rkey(item.id_key),
             record=review_record,
+        )
+
+    def sync_show_progress(
+        self,
+        episodes: list[SimklEpisode],
+        season_totals: dict[int, dict[int, int]],
+        list_uris: dict[str, str],
+    ) -> None:
+        """Mark seasons/series complete once every episode of them is watched.
+
+        Mirrors jellyfin_popfeed's ``UpsertTvShowProgressAsync``/
+        ``ReconcileSeasonMarkerAsync`` exactly: one ``tv_show`` progress
+        record per series (always present, ``#in_progress`` until every
+        season with known episodes is complete, then ``#finished``), and
+        one ``tv_season`` record per *complete* season only — an
+        incomplete season has no record at all, so a season that
+        regresses (shouldn't normally happen, since nothing here removes
+        watched status) has its marker deleted rather than left stale.
+
+        Parameters:
+            episodes (list[SimklEpisode]): Every currently-known-watched
+                episode across all shows (not just this run's new ones —
+                completion needs the full picture).
+            season_totals (dict[int, dict[int, int]]): Per-show mapping of
+                season number to total episode count, from
+                :meth:`simkl_popfeed.tmdb.TmdbClient.get_season_episode_counts`.
+                Shows missing from this dict are skipped entirely (TMDb
+                lookup failed or wasn't attempted).
+            list_uris (dict[str, str]): Mapping of list type to AT URI, as
+                returned by :meth:`ensure_lists`.
+        """
+        did = self._atproto.session.did
+        by_show: dict[int, list[SimklEpisode]] = {}
+        for ep in episodes:
+            by_show.setdefault(ep.show_tmdb_id, []).append(ep)
+
+        for show_tmdb_id, show_episodes in by_show.items():
+            totals = season_totals.get(show_tmdb_id)
+            if not totals:
+                continue
+
+            show_title = show_episodes[0].show_title
+            watched_by_season: dict[int, set[int]] = {}
+            for ep in show_episodes:
+                watched_by_season.setdefault(ep.season, set()).add(ep.number)
+
+            season_complete = {
+                season: len(watched_by_season.get(season, set())) >= total
+                for season, total in totals.items()
+            }
+            for season in totals:
+                self._sync_season_marker(
+                    did, show_tmdb_id, show_title, season, season_complete[season], list_uris
+                )
+
+            series_complete = all(season_complete.values())
+            self._sync_show_progress_record(
+                did, show_tmdb_id, show_title, series_complete, show_episodes, list_uris
+            )
+
+    def _sync_season_marker(
+        self,
+        did: str,
+        show_tmdb_id: int,
+        show_title: str,
+        season: int,
+        is_complete: bool,
+        list_uris: dict[str, str],
+    ) -> None:
+        """Create, update, or remove a single season's completion marker."""
+        rkey = _tv_season_rkey(show_tmdb_id, season)
+
+        if not is_complete:
+            if not self._dry_run:
+                self._atproto.delete_record(did, _COLLECTION_LIST_ITEM, rkey)
+            return
+
+        now = _now_iso()
+        if self._dry_run:
+            logger.info(
+                "[dry-run] Would mark %r Season %d complete", show_title, season
+            )
+            return
+
+        existing = self._atproto.get_record(did, _COLLECTION_LIST_ITEM, rkey)
+        added_at = ((existing or {}).get("value") or {}).get("addedAt") or now
+        title = f"{show_title} - Season {season:02d}" if show_title else f"Season {season:02d}"
+
+        self._atproto.put_record(
+            did=did,
+            collection=_COLLECTION_LIST_ITEM,
+            rkey=rkey,
+            record={
+                "$type": _COLLECTION_LIST_ITEM,
+                "identifiers": PopfeedIdentifiers(
+                    tmdb_tv_series_id=show_tmdb_id, season_number=season
+                ).as_dict(),
+                "creativeWorkType": "tv_season",
+                "listUri": list_uris["watched_tv_shows"],
+                "listType": "watched_tv_shows",
+                "status": _STATUS_FINISHED,
+                "addedAt": added_at,
+                "completedAt": now,
+                "title": title,
+            },
+        )
+        logger.info("Marked %r Season %d complete", show_title, season)
+
+    def _sync_show_progress_record(
+        self,
+        did: str,
+        show_tmdb_id: int,
+        show_title: str,
+        is_complete: bool,
+        episodes: list[SimklEpisode],
+        list_uris: dict[str, str],
+    ) -> None:
+        """Create or update a series' overall progress record."""
+        rkey = _tv_show_rkey(show_tmdb_id)
+        now = _now_iso()
+        if self._dry_run:
+            logger.info(
+                "[dry-run] Would update show progress for %r (%d episode(s) watched, complete=%s)",
+                show_title,
+                len(episodes),
+                is_complete,
+            )
+            return
+
+        existing = self._atproto.get_record(did, _COLLECTION_LIST_ITEM, rkey)
+        added_at = ((existing or {}).get("value") or {}).get("addedAt") or now
+        watched_episodes = [
+            {"seasonNumber": ep.season, "episodeNumber": ep.number}
+            for ep in sorted(episodes, key=lambda e: (e.season, e.number))
+        ]
+
+        # Matches jellyfin_popfeed's PopfeedIdentifiers { TmdbId = seriesId }
+        # for tv_show records specifically — tmdbId, not tmdbTvSeriesId.
+        record: dict = {
+            "$type": _COLLECTION_LIST_ITEM,
+            "identifiers": PopfeedIdentifiers(tmdb_id=show_tmdb_id).as_dict(),
+            "creativeWorkType": "tv_show",
+            "listUri": list_uris["watched_tv_shows"],
+            "listType": "watched_tv_shows",
+            "status": _STATUS_FINISHED if is_complete else _STATUS_IN_PROGRESS,
+            "addedAt": added_at,
+            "title": show_title,
+            "watchedEpisodes": watched_episodes,
+        }
+        if is_complete:
+            record["completedAt"] = now
+
+        self._atproto.put_record(
+            did=did, collection=_COLLECTION_LIST_ITEM, rkey=rkey, record=record
+        )
+        logger.info(
+            "Updated show progress for %r (%d episode(s) watched, complete=%s)",
+            show_title,
+            len(episodes),
+            is_complete,
         )
 
 
