@@ -1,4 +1,4 @@
-name: Sync Simkl → Popfeed
+name: Sync Popfeed ⇄ Simkl
 
 on:
     schedule:

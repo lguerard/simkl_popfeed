@@ -386,6 +386,111 @@ class SimklClient:
         return result
 
 
+def movies_to_history_payload(movies: list[SimklMovie]) -> list[dict]:
+    """Build ``POST /sync/history`` movie entries from SimklMovie objects.
+
+    Used by ``sync.py`` to push Popfeed's existing watched-list items to
+    Simkl. ``scripts/migrate_seriesguide.py`` has its own
+    SeriesGuide-export-shaped equivalent since its source dicts use
+    different field names entirely.
+
+    Parameters:
+        movies (list[SimklMovie]): Movies to mark watched on Simkl.
+
+    Returns:
+        list[dict]: Payload entries for the ``movies`` array.
+    """
+    payload: list[dict] = []
+    for movie in movies:
+        ids: dict = {"tmdb": movie.tmdb_id}
+        if movie.imdb_id:
+            ids["imdb"] = movie.imdb_id
+        payload.append({"ids": ids, "status": "completed"})
+    return payload
+
+
+def episodes_to_history_payload(episodes: list[SimklEpisode]) -> list[dict]:
+    """Build ``POST /sync/history`` show entries from SimklEpisode objects.
+
+    Groups episodes by series (Simkl's history endpoint wants one entry
+    per show with nested seasons/episodes, not one entry per episode).
+
+    Parameters:
+        episodes (list[SimklEpisode]): Episodes to mark watched on Simkl.
+
+    Returns:
+        list[dict]: Payload entries for the ``shows`` array.
+    """
+    shows: dict[int, dict] = {}
+    for ep in episodes:
+        show = shows.setdefault(
+            ep.show_tmdb_id, {"ids": {"tmdb": ep.show_tmdb_id}, "seasons": {}}
+        )
+        if ep.show_imdb_id:
+            show["ids"]["imdb"] = ep.show_imdb_id
+        show["seasons"].setdefault(ep.season, []).append({"number": ep.number})
+
+    payload: list[dict] = []
+    for show in shows.values():
+        payload.append(
+            {
+                "ids": show["ids"],
+                "seasons": [
+                    {"number": num, "episodes": eps}
+                    for num, eps in sorted(show["seasons"].items())
+                ],
+            }
+        )
+    return payload
+
+
+def send_in_batches(
+    send_fn,
+    key: str,
+    items: list[dict],
+    dry_run: bool = False,
+    batch_size: int = 50,
+    delay_seconds: float = 2.0,
+) -> None:
+    """POST ``items`` in batches via ``send_fn``, sequentially.
+
+    Shared by the daily sync's Popfeed->Simkl push and
+    ``scripts/migrate_seriesguide.py``. Simkl recommends batching ~50
+    items per call rather than one call per item, and enforces a
+    20-second per-user write lock that rejects concurrent writes — hence
+    sequential sends with a delay between batches rather than one big
+    request or parallel requests.
+
+    Parameters:
+        send_fn (Callable[..., dict]): ``client.add_to_history`` or
+            ``client.add_to_watchlist`` — takes ``movies=`` / ``shows=``
+            kwargs.
+        key (str): ``"movies"`` or ``"shows"`` — which kwarg ``items``
+            populates (the other is sent empty).
+        items (list[dict]): Payload dicts to send.
+        dry_run (bool): If True, log without sending.
+        batch_size (int): Items per call.
+        delay_seconds (float): Delay between batches.
+    """
+    for i in range(0, len(items), batch_size):
+        batch = items[i : i + batch_size]
+        if dry_run:
+            logger.info("[dry-run] Would send %d %s", len(batch), key)
+            continue
+        kwargs = (
+            {"movies": batch, "shows": []}
+            if key == "movies"
+            else {"movies": [], "shows": batch}
+        )
+        result = send_fn(**kwargs)
+        logger.info("Batch result: %s", result.get("added"))
+        not_found = result.get("not_found", {})
+        if any(not_found.values()):
+            logger.warning("Some items not found by Simkl: %s", not_found)
+        if i + batch_size < len(items):
+            time.sleep(delay_seconds)
+
+
 def _parse_int(value: Any) -> Optional[int]:
     """Best-effort int conversion for id fields Simkl sometimes returns as strings.
 

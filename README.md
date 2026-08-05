@@ -1,16 +1,22 @@
 # simkl_popfeed
 
-Sync a [Simkl](https://simkl.com) profile's watch history to
-[Popfeed](https://popfeed.social) via the AT Protocol.
+Bidirectional sync between [Simkl](https://simkl.com) and
+[Popfeed](https://popfeed.social): watching something anywhere Simkl
+knows about (Cinopsys, etc.) makes it show up on Popfeed, and anything
+already on Popfeed (including things watched in Jellyfin, via
+jellyfin_popfeed — see below) makes it show up in Simkl too — without
+ever duplicating anything jellyfin_popfeed already wrote directly. See
+[How it works](#how-it-works) and [How dedup works](#how-dedup-works).
 
-This is a sibling of [jellyfin_popfeed](https://github.com/lguerard/jellyfin_popfeed),
-which syncs watch state from a Jellyfin server, and
+This is a sibling of [jellyfin_popfeed](https://github.com/lguerard/jellyfin_popfeed)
+(the Jellyfin plugin that writes straight to Popfeed — unchanged, not
+touched by this project; it runs on the Jellyfin server itself, so
+Jellyfin's watch history reaches Simkl through Popfeed rather than this
+sync talking to Jellyfin directly, which matters if your Jellyfin server
+isn't reachable from wherever this sync runs) and
 [trakt_popfeed](https://github.com/lguerard/trakt_popfeed) (Trakt-based;
 kept around but superseded for this use case once creating a Trakt API
-application started requiring Trakt VIP). `simkl_popfeed` fills in
-everything *not* watched through Jellyfin without ever duplicating or
-overwriting what jellyfin_popfeed already tracked — see
-[How dedup works](#how-dedup-works).
+application started requiring Trakt VIP).
 
 ## Requirements
 
@@ -82,9 +88,20 @@ simkl-popfeed --env-file /path/to/.env
 
 ## How It Works
 
-1. Fetches the full watched-movies and watched-shows history from Simkl
-   (`/sync/all-items`), plus ratings.
-2. Authenticates with the Popfeed PDS via AT Protocol.
+1. Authenticates with the Popfeed PDS via AT Protocol, then reads every
+   item already on Popfeed's "Watched Movies"/"Watched Shows" lists (this
+   includes anything jellyfin_popfeed wrote there directly, and anything
+   a previous run of this sync wrote) and pushes all of it to Simkl via
+   `POST /sync/history`. This call is idempotent, so it's safe to repeat
+   every run for items Simkl already has. Best-effort: a failure here is
+   logged and the rest of the sync still runs — this is how Jellyfin
+   activity ends up in Simkl without this sync ever talking to Jellyfin
+   directly (jellyfin_popfeed already put it on Popfeed; this step
+   forwards it from there).
+2. Fetches the full watched-movies and watched-shows history from Simkl
+   (`/sync/all-items`), plus ratings — this now includes whatever step 1
+   just pushed, though that doesn't matter for what happens next since
+   those items are already on Popfeed (the rkey dedup below skips them).
 3. Finds or creates the "Watched Movies" / "Watched Shows" / "Recent"
    lists — **by name**, so it reuses the exact lists jellyfin_popfeed
    already created instead of making duplicates.
@@ -167,3 +184,6 @@ repository secrets/variables:
 - `secrets.POPFEED_IDENTIFIER`
 - `secrets.POPFEED_PASSWORD`
 - `vars.POPFEED_PDS_URL` (optional)
+
+No Jellyfin-reachability considerations here — this sync only ever talks
+to Popfeed and Simkl, both reachable from GitHub's hosted runners.

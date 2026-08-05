@@ -43,9 +43,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         prog="simkl-popfeed",
         description=(
-            "Sync a Simkl profile's watch history to Popfeed via AT "
-            "Protocol, skipping anything already tracked by "
-            "jellyfin_popfeed."
+            "Bidirectional sync between a Simkl profile and Popfeed (AT "
+            "Protocol), skipping anything already tracked under the same "
+            "record on either side."
         ),
     )
     parser.add_argument(

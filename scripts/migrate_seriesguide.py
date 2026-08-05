@@ -30,7 +30,6 @@ Usage:
 import argparse
 import logging
 import sys
-import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -40,7 +39,7 @@ import os  # noqa: E402
 
 from dotenv import load_dotenv  # noqa: E402
 
-from simkl_popfeed.simkl import SimklClient, SimklError  # noqa: E402
+from simkl_popfeed.simkl import SimklClient, SimklError, send_in_batches  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(message)s")
 logger = logging.getLogger(__name__)
@@ -212,31 +211,6 @@ def build_list_payloads(
     return movie_payloads, show_payloads, skipped
 
 
-def _send_in_batches(send_fn, key: str, items: list[dict], dry_run: bool) -> None:
-    """POST ``items`` in batches of BATCH_SIZE via ``send_fn``, sequentially.
-
-    Parameters:
-        send_fn (Callable[[list, list], dict]): ``client.add_to_history``
-            or ``client.add_to_watchlist``.
-        key (str): ``"movies"`` or ``"shows"``.
-        items (list[dict]): Payload dicts to send.
-        dry_run (bool): If True, log without sending.
-    """
-    for i in range(0, len(items), BATCH_SIZE):
-        batch = items[i : i + BATCH_SIZE]
-        if dry_run:
-            logger.info("[dry-run] Would send %d %s", len(batch), key)
-            continue
-        kwargs = {"movies": batch, "shows": []} if key == "movies" else {"movies": [], "shows": batch}
-        result = send_fn(**kwargs)
-        logger.info("Batch result: %s", result.get("added"))
-        not_found = result.get("not_found", {})
-        if any(not_found.values()):
-            logger.warning("Some items not found by Simkl: %s", not_found)
-        if i + BATCH_SIZE < len(items):
-            time.sleep(BATCH_DELAY_SECONDS)
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--shows-file", help="Path to SeriesGuide shows JSON export")
@@ -295,13 +269,21 @@ def main() -> None:
 
     with SimklClient(client_id, access_token) as client:
         try:
-            _send_in_batches(client.add_to_history, "movies", movie_payloads, args.dry_run)
-            _send_in_batches(client.add_to_history, "shows", show_payloads, args.dry_run)
-            _send_in_batches(
-                client.add_to_watchlist, "movies", list_movie_payloads, args.dry_run
+            send_in_batches(
+                client.add_to_history, "movies", movie_payloads, args.dry_run,
+                batch_size=BATCH_SIZE, delay_seconds=BATCH_DELAY_SECONDS,
             )
-            _send_in_batches(
-                client.add_to_watchlist, "shows", list_show_payloads, args.dry_run
+            send_in_batches(
+                client.add_to_history, "shows", show_payloads, args.dry_run,
+                batch_size=BATCH_SIZE, delay_seconds=BATCH_DELAY_SECONDS,
+            )
+            send_in_batches(
+                client.add_to_watchlist, "movies", list_movie_payloads, args.dry_run,
+                batch_size=BATCH_SIZE, delay_seconds=BATCH_DELAY_SECONDS,
+            )
+            send_in_batches(
+                client.add_to_watchlist, "shows", list_show_payloads, args.dry_run,
+                batch_size=BATCH_SIZE, delay_seconds=BATCH_DELAY_SECONDS,
             )
         except SimklError as exc:
             print(f"Simkl API error: {exc}", file=sys.stderr)

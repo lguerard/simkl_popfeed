@@ -412,3 +412,75 @@ class PopfeedClient:
             rkey=_review_rkey(item.id_key),
             record=review_record,
         )
+
+
+def read_watched_items(
+    atproto: AtProtoClient,
+) -> tuple[list[SimklMovie], list[SimklEpisode]]:
+    """Read every watched movie/episode already on Popfeed.
+
+    This is the other half of the bidirectional sync: it reads
+    ``social.popfeed.feed.listItem`` records with a ``watched_movies``/
+    ``watched_tv_shows`` ``listType`` — written either by jellyfin_popfeed
+    (which runs on the Jellyfin server itself, so it needs no network
+    access from here — the Jellyfin data just already being on Popfeed is
+    what this bridges through) or by a previous run of this sync — and
+    returns them as :class:`SimklMovie`/:class:`SimklEpisode` so
+    :func:`simkl_popfeed.simkl.movies_to_history_payload`/
+    :func:`simkl_popfeed.simkl.episodes_to_history_payload` can push them
+    to Simkl.
+
+    "Recent"-list copies of the same items are skipped naturally: only
+    the primary watched-list record carries a ``listType`` field (the
+    Recent-list record for the same item does not), so filtering on
+    ``listType`` also avoids double-counting each item.
+
+    Parameters:
+        atproto (AtProtoClient): Authenticated AT Protocol client.
+
+    Returns:
+        tuple[list[SimklMovie], list[SimklEpisode]]: Movies and episodes
+            found on Popfeed's watched lists.
+    """
+    did = atproto.session.did
+    movies: list[SimklMovie] = []
+    episodes: list[SimklEpisode] = []
+
+    for record in atproto.iter_all_records(did, _COLLECTION_LIST_ITEM):
+        value: dict = record.get("value", {})
+        if value.get("listType") not in ("watched_movies", "watched_tv_shows"):
+            continue
+        identifiers: dict = value.get("identifiers", {})
+        title = value.get("title", "")
+
+        if value.get("creativeWorkType") == "movie":
+            tmdb_id = identifiers.get("tmdbId")
+            if not tmdb_id:
+                continue
+            movies.append(
+                SimklMovie(
+                    tmdb_id=tmdb_id, imdb_id=identifiers.get("imdbId"), title=title
+                )
+            )
+        elif value.get("creativeWorkType") == "tv_episode":
+            show_tmdb_id = identifiers.get("tmdbTvSeriesId")
+            season = identifiers.get("seasonNumber")
+            number = identifiers.get("episodeNumber")
+            if show_tmdb_id is None or season is None or number is None:
+                continue
+            episodes.append(
+                SimklEpisode(
+                    show_tmdb_id=show_tmdb_id,
+                    show_imdb_id=identifiers.get("imdbId"),
+                    show_title=title,
+                    season=season,
+                    number=number,
+                )
+            )
+
+    logger.info(
+        "Read %d watched movie(s) / %d watched episode(s) from Popfeed",
+        len(movies),
+        len(episodes),
+    )
+    return movies, episodes
