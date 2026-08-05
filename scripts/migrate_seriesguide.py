@@ -7,6 +7,16 @@ SeriesGuide's local JSON export directly and writing watched status via
 Simkl's free developer API (``POST /sync/history``, confirmed NOT
 VIP-gated). Run once, not part of the daily sync.
 
+Also handles SeriesGuide's custom Lists export, best-effort: Simkl's API
+has no custom-list endpoint at all (confirmed absent from its OpenAPI
+spec), so list items are placed on Simkl's "plan to watch" watchlist
+status instead via ``/sync/add-to-list`` — the closest available
+equivalent. This loses the original list name/grouping. Items already
+covered by --movies-file/--shows-file's watched data are excluded from
+this step so a completed show doesn't get downgraded back to plan-to-watch
+(Simkl's own docs warn against calling add-to-list on items already sent
+to /sync/history in the same run).
+
 ponytail: SeriesGuide's export schema is documented at
 https://github.com/UweTrottmann/SeriesGuide/blob/dev/docs/backup-json-schema.md
 but this parser hasn't been run against a real export file yet — it tries
@@ -18,7 +28,7 @@ file, drop the fallback branches and keep only the correct key names.
 
 Usage:
     python scripts/migrate_seriesguide.py --shows-file shows-export.json \\
-        --movies-file movies-export.json
+        --movies-file movies-export.json --lists-file lists-export.json
 """
 
 import argparse
@@ -126,15 +136,99 @@ def build_show_payloads(shows_export: dict) -> tuple[list[dict], int]:
     return payloads, skipped
 
 
-def _send_in_batches(client: SimklClient, key: str, items: list[dict], dry_run: bool) -> None:
-    """POST ``items`` to /sync/history in batches of BATCH_SIZE, sequentially."""
+def build_list_payloads(
+    lists_export: dict,
+    exclude_show_tmdb_ids: set[int],
+) -> tuple[list[dict], list[dict], int]:
+    """Build Simkl /sync/add-to-list payloads from a SeriesGuide lists export.
+
+    Simkl has no custom-list API, so every item is placed on the
+    "plantowatch" watchlist status instead — the list name/grouping
+    itself is not preserved. Shows already covered by --shows-file are
+    skipped here so they aren't downgraded back to plan-to-watch after
+    already being marked watched/completed (Simkl's own docs warn against
+    calling add-to-list on an item already sent to /sync/history).
+
+    Movies aren't cross-referenced against --movies-file: SeriesGuide list
+    items of type "imdb-movie" only carry an IMDb id, and the movie
+    watched-history payloads are keyed on TMDb id, so there's no shared
+    key to exclude on. Ceiling worth knowing about: a movie both watched
+    and listed could get a redundant plantowatch call after already being
+    marked completed — untested against Simkl's real conflict-resolution
+    behavior for that specific case.
+
+    Parameters:
+        lists_export (dict): Parsed SeriesGuide lists JSON export.
+        exclude_show_tmdb_ids (set[int]): TMDb show IDs already handled as
+            watched history.
+
+    Returns:
+        tuple[list[dict], list[dict], int]: (movie_payloads,
+            show_payloads, skipped_count).
+    """
+    movie_payloads: list[dict] = []
+    show_payloads: list[dict] = []
+    skipped = 0
+
+    for lst in lists_export.get("lists", []):
+        for item in lst.get("items", []):
+            item_type = item.get("type")
+            external_id = item.get("externalId")
+            tvdb_id = item.get("tvdb_id")
+
+            if item_type == "imdb-movie" and external_id:
+                # externalId is an IMDb id string (e.g. "tt1375666") for
+                # this type; Simkl accepts imdb directly, no tmdb needed.
+                movie_payloads.append(
+                    {"to": "plantowatch", "ids": {"imdb": external_id}}
+                )
+            elif item_type == "tmdb-show" and external_id:
+                try:
+                    tmdb_id = int(external_id)
+                except (TypeError, ValueError):
+                    logger.warning("Skipping show with non-numeric tmdb id: %r", external_id)
+                    skipped += 1
+                    continue
+                if tmdb_id in exclude_show_tmdb_ids:
+                    continue
+                show_payloads.append(
+                    {"to": "plantowatch", "ids": {"tmdb": tmdb_id}}
+                )
+            elif item_type == "show" and tvdb_id:
+                show_payloads.append(
+                    {"to": "plantowatch", "ids": {"tvdb": tvdb_id}}
+                )
+            else:
+                # "episode"/"season" list items, or an unrecognised type —
+                # no clean equivalent on Simkl's whole-show watchlist.
+                logger.warning(
+                    "Skipping list item with unsupported type %r: %s",
+                    item_type,
+                    item.get("list_item_id", "?"),
+                )
+                skipped += 1
+                continue
+
+    return movie_payloads, show_payloads, skipped
+
+
+def _send_in_batches(send_fn, key: str, items: list[dict], dry_run: bool) -> None:
+    """POST ``items`` in batches of BATCH_SIZE via ``send_fn``, sequentially.
+
+    Parameters:
+        send_fn (Callable[[list, list], dict]): ``client.add_to_history``
+            or ``client.add_to_watchlist``.
+        key (str): ``"movies"`` or ``"shows"``.
+        items (list[dict]): Payload dicts to send.
+        dry_run (bool): If True, log without sending.
+    """
     for i in range(0, len(items), BATCH_SIZE):
         batch = items[i : i + BATCH_SIZE]
         if dry_run:
             logger.info("[dry-run] Would send %d %s", len(batch), key)
             continue
         kwargs = {"movies": batch, "shows": []} if key == "movies" else {"movies": [], "shows": batch}
-        result = client.add_to_history(**kwargs)
+        result = send_fn(**kwargs)
         logger.info("Batch result: %s", result.get("added"))
         not_found = result.get("not_found", {})
         if any(not_found.values()):
@@ -147,12 +241,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--shows-file", help="Path to SeriesGuide shows JSON export")
     parser.add_argument("--movies-file", help="Path to SeriesGuide movies JSON export")
+    parser.add_argument("--lists-file", help="Path to SeriesGuide lists JSON export")
     parser.add_argument("--env-file", default=".env")
     parser.add_argument("--dry-run", action="store_true", default=False)
     args = parser.parse_args()
 
-    if not args.shows_file and not args.movies_file:
-        parser.error("at least one of --shows-file / --movies-file is required")
+    if not args.shows_file and not args.movies_file and not args.lists_file:
+        parser.error(
+            "at least one of --shows-file / --movies-file / --lists-file is required"
+        )
 
     load_dotenv(dotenv_path=args.env_file)
     client_id = os.environ.get("SIMKL_CLIENT_ID", "").strip()
@@ -179,13 +276,33 @@ def main() -> None:
         skipped += show_skipped
         logger.info("%d shows with watched episodes to migrate", len(show_payloads))
 
+    list_movie_payloads: list[dict] = []
+    list_show_payloads: list[dict] = []
+    if args.lists_file:
+        already_watched_show_ids = {p["ids"]["tmdb"] for p in show_payloads}
+        list_movie_payloads, list_show_payloads, list_skipped = build_list_payloads(
+            _load(args.lists_file), already_watched_show_ids
+        )
+        skipped += list_skipped
+        logger.info(
+            "%d list movies / %d list shows to add as plan-to-watch",
+            len(list_movie_payloads),
+            len(list_show_payloads),
+        )
+
     if skipped:
         logger.warning("%d items skipped due to missing tmdb_id/season/number", skipped)
 
     with SimklClient(client_id, access_token) as client:
         try:
-            _send_in_batches(client, "movies", movie_payloads, args.dry_run)
-            _send_in_batches(client, "shows", show_payloads, args.dry_run)
+            _send_in_batches(client.add_to_history, "movies", movie_payloads, args.dry_run)
+            _send_in_batches(client.add_to_history, "shows", show_payloads, args.dry_run)
+            _send_in_batches(
+                client.add_to_watchlist, "movies", list_movie_payloads, args.dry_run
+            )
+            _send_in_batches(
+                client.add_to_watchlist, "shows", list_show_payloads, args.dry_run
+            )
         except SimklError as exc:
             print(f"Simkl API error: {exc}", file=sys.stderr)
             sys.exit(1)

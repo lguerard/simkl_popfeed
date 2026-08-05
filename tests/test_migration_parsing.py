@@ -9,7 +9,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
-from migrate_seriesguide import build_movie_payloads, build_show_payloads  # noqa: E402
+from migrate_seriesguide import (  # noqa: E402
+    build_list_payloads,
+    build_movie_payloads,
+    build_show_payloads,
+)
 
 
 def test_build_movie_payloads_skips_unwatched_and_missing_tmdb_id() -> None:
@@ -53,7 +57,48 @@ def test_build_show_payloads_groups_episodes_by_show() -> None:
     ]
 
 
+def test_build_list_payloads_maps_types_to_plantowatch() -> None:
+    export = {
+        "lists": [
+            {
+                "list_id": "watchlist",
+                "name": "Want to watch",
+                "items": [
+                    {"type": "tmdb-show", "externalId": "1399", "list_item_id": "a"},
+                    {"type": "imdb-movie", "externalId": "tt0111161", "list_item_id": "b"},
+                    {"type": "show", "tvdb_id": 121361, "list_item_id": "c"},
+                    {"type": "episode", "list_item_id": "d"},
+                ],
+            }
+        ]
+    }
+    movies, shows, skipped = build_list_payloads(export, exclude_show_tmdb_ids=set())
+    assert movies == [{"to": "plantowatch", "ids": {"imdb": "tt0111161"}}]
+    assert shows == [
+        {"to": "plantowatch", "ids": {"tmdb": 1399}},
+        {"to": "plantowatch", "ids": {"tvdb": 121361}},
+    ]
+    assert skipped == 1
+
+
+def test_build_list_payloads_excludes_already_watched_shows() -> None:
+    export = {
+        "lists": [
+            {
+                "items": [
+                    {"type": "tmdb-show", "externalId": "1399"},
+                ]
+            }
+        ]
+    }
+    movies, shows, skipped = build_list_payloads(export, exclude_show_tmdb_ids={1399})
+    assert shows == []
+    assert skipped == 0
+
+
 if __name__ == "__main__":
     test_build_movie_payloads_skips_unwatched_and_missing_tmdb_id()
     test_build_show_payloads_groups_episodes_by_show()
+    test_build_list_payloads_maps_types_to_plantowatch()
+    test_build_list_payloads_excludes_already_watched_shows()
     print("ok")

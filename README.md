@@ -123,13 +123,22 @@ but the underlying API write endpoint isn't).
 ```bash
 python scripts/migrate_seriesguide.py \
     --movies-file path/to/movies-export.json \
-    --shows-file path/to/shows-export.json
+    --shows-file path/to/shows-export.json \
+    --lists-file path/to/lists-export.json
 ```
 
 Run `simkl-popfeed --setup` first so `SIMKL_ACCESS_TOKEN` is set. Note
 SeriesGuide never stores per-episode watch *dates* (only a watched flag),
 so migrated items land in Simkl without original watch dates — that's a
 SeriesGuide limitation, not something this script can recover.
+
+`--lists-file` is optional and handles SeriesGuide's custom Lists export
+best-effort: **Simkl's API has no custom-list endpoint at all**, so list
+items are placed on Simkl's "plan to watch" status instead via
+`/sync/add-to-list` — the list name/grouping itself is lost. If you want
+to preserve actual named lists, recreate them manually on Simkl's website
+(which does support custom lists, just not through the API) instead of
+using this flag.
 
 ## Limitations
 

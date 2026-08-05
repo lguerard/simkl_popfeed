@@ -214,6 +214,55 @@ class SimklClient:
             raise SimklError(f"add_to_history request failed: {exc}") from exc
         return response.json()
 
+    def add_to_watchlist(self, movies: list[dict], shows: list[dict]) -> dict:
+        """POST a batch of items to ``/sync/add-to-list``.
+
+        Used by the SeriesGuide migration script for items that came from
+        a SeriesGuide custom list rather than watched history — Simkl has
+        no custom-list API (confirmed absent from its OpenAPI spec, which
+        explicitly notes "Custom user-created lists will get their own API
+        in a future release"), so the closest equivalent is placing the
+        item on one of Simkl's five built-in watchlist statuses via each
+        item's own ``"to"`` key (e.g. ``"plantowatch"``).
+
+        Per Simkl's own docs, don't call this for anything already sent to
+        :meth:`add_to_history` in the same run — history writes already
+        resolve the right status server-side, and a follow-up
+        ``add-to-list`` call can downgrade that (e.g. revert a
+        newly-completed show back to "plan to watch").
+
+        Parameters:
+            movies (list[dict]): Movie entries, each at minimum
+                ``{"to": "plantowatch", "ids": {"tmdb": ...}}``.
+            shows (list[dict]): Show entries, same shape.
+
+        Returns:
+            dict: Simkl's response, including ``added``/``not_found``.
+
+        Raises:
+            SimklError: On HTTP or request failure.
+        """
+        body: dict = {}
+        if movies:
+            body["movies"] = movies
+        if shows:
+            body["shows"] = shows
+        try:
+            response = self._http.post(
+                "/sync/add-to-list",
+                params=self._base_params(),
+                json=body,
+                headers=self._auth_headers(),
+            )
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise SimklError(
+                f"HTTP {exc.response.status_code} adding to watchlist: {exc.response.text[:200]}"
+            ) from exc
+        except httpx.RequestError as exc:
+            raise SimklError(f"add_to_watchlist request failed: {exc}") from exc
+        return response.json()
+
     def get_watched_movies(self) -> list[SimklMovie]:
         """Fetch every movie marked completed on Simkl.
 
