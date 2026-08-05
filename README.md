@@ -185,6 +185,18 @@ using this flag.
   `SIMKL_POPFEED_*_LIST_NAME` overrides above so this sync reuses the same
   lists instead of creating new ones.
 
+## Fixing records from before the status-literal bug fix
+
+If you ran this sync before the `"#finished"` status fix, every record it
+wrote has the wrong (silently ignored by the Popfeed app) status value.
+The regular sync only checks whether a record *exists*, not whether it's
+correct, so it never revisits them. Run this once to fix them in place:
+
+```bash
+python scripts/fix_legacy_status.py --dry-run   # see what would change
+python scripts/fix_legacy_status.py             # actually fix them
+```
+
 ## GitHub Actions
 
 `.github/workflows/sync.yml` runs the sync daily via cron
