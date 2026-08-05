@@ -17,14 +17,10 @@ this step so a completed show doesn't get downgraded back to plan-to-watch
 (Simkl's own docs warn against calling add-to-list on items already sent
 to /sync/history in the same run).
 
-ponytail: SeriesGuide's export schema is documented at
-https://github.com/UweTrottmann/SeriesGuide/blob/dev/docs/backup-json-schema.md
-but this parser hasn't been run against a real export file yet — it tries
-a couple of plausible key names for season/episode numbers
-(``number``/``season``/``episode``) and prints the top-level keys of any
-show/movie entry it can't parse, so a real export's actual field names can
-be spotted and fixed quickly. Upgrade path: once confirmed against a real
-file, drop the fallback branches and keep only the correct key names.
+Verified against real SeriesGuide export files (More -> Export and Import):
+each file's top level is a bare JSON array (not wrapped in a
+``{"movies": [...]}``-style object), of movie/show/list objects using
+``tmdb_id``/``watched``/``season``/``episode`` field names directly.
 
 Usage:
     python scripts/migrate_seriesguide.py --shows-file shows-export.json \\
@@ -53,31 +49,28 @@ BATCH_SIZE = 50
 BATCH_DELAY_SECONDS = 2.0
 
 
-def _first(entry: dict, *keys: str):
-    """Return the first present, non-None value among ``keys`` in ``entry``."""
-    for key in keys:
-        if entry.get(key) is not None:
-            return entry.get(key)
-    return None
-
-
-def _load(path: str) -> dict:
+def _load(path: str) -> list[dict]:
+    """Load a SeriesGuide JSON export file (a bare top-level array)."""
     with open(path, encoding="utf-8") as f:
         return json.load(f)
 
 
-def build_movie_payloads(movies_export: dict) -> tuple[list[dict], int]:
+def build_movie_payloads(movies_export: list[dict]) -> tuple[list[dict], int]:
     """Build Simkl /sync/history movie payloads from a SeriesGuide export.
+
+    Parameters:
+        movies_export (list[dict]): Parsed SeriesGuide movies JSON export
+            (a bare top-level array of movie objects).
 
     Returns:
         tuple[list[dict], int]: (payloads, skipped_count).
     """
     payloads: list[dict] = []
     skipped = 0
-    for movie in movies_export.get("movies", []):
+    for movie in movies_export:
         if not movie.get("watched"):
             continue
-        tmdb_id = _first(movie, "tmdb_id")
+        tmdb_id = movie.get("tmdb_id")
         if not tmdb_id:
             logger.warning(
                 "Skipping movie with no tmdb_id: keys=%s", sorted(movie.keys())
@@ -88,16 +81,21 @@ def build_movie_payloads(movies_export: dict) -> tuple[list[dict], int]:
     return payloads, skipped
 
 
-def build_show_payloads(shows_export: dict) -> tuple[list[dict], int]:
+def build_show_payloads(shows_export: list[dict]) -> tuple[list[dict], int]:
     """Build Simkl /sync/history show payloads from a SeriesGuide export.
+
+    Parameters:
+        shows_export (list[dict]): Parsed SeriesGuide shows JSON export (a
+            bare top-level array of show objects, each with nested
+            ``seasons[].episodes[]``).
 
     Returns:
         tuple[list[dict], int]: (payloads, skipped_episode_count).
     """
     payloads: list[dict] = []
     skipped = 0
-    for show in shows_export.get("shows", []):
-        show_tmdb_id = _first(show, "tmdb_id")
+    for show in shows_export:
+        show_tmdb_id = show.get("tmdb_id")
         if not show_tmdb_id:
             logger.warning(
                 "Skipping show with no tmdb_id: %r", show.get("title", "?")
@@ -106,14 +104,14 @@ def build_show_payloads(shows_export: dict) -> tuple[list[dict], int]:
 
         seasons_out: dict[int, list[dict]] = {}
         for season in show.get("seasons", []):
-            season_number = _first(season, "season", "number")
+            season_number = season.get("season")
             for ep in season.get("episodes", []):
                 if not ep.get("watched"):
                     continue
-                episode_number = _first(ep, "episode", "number")
+                episode_number = ep.get("episode")
                 if season_number is None or episode_number is None:
                     logger.warning(
-                        "Skipping episode with no season/number in %r: keys=%s",
+                        "Skipping episode with no season/episode number in %r: keys=%s",
                         show.get("title", "?"),
                         sorted(ep.keys()),
                     )
@@ -137,7 +135,7 @@ def build_show_payloads(shows_export: dict) -> tuple[list[dict], int]:
 
 
 def build_list_payloads(
-    lists_export: dict,
+    lists_export: list[dict],
     exclude_show_tmdb_ids: set[int],
 ) -> tuple[list[dict], list[dict], int]:
     """Build Simkl /sync/add-to-list payloads from a SeriesGuide lists export.
@@ -158,7 +156,9 @@ def build_list_payloads(
     behavior for that specific case.
 
     Parameters:
-        lists_export (dict): Parsed SeriesGuide lists JSON export.
+        lists_export (list[dict]): Parsed SeriesGuide lists JSON export (a
+            bare top-level array of list objects, each with an
+            ``items[]`` array).
         exclude_show_tmdb_ids (set[int]): TMDb show IDs already handled as
             watched history.
 
@@ -170,7 +170,7 @@ def build_list_payloads(
     show_payloads: list[dict] = []
     skipped = 0
 
-    for lst in lists_export.get("lists", []):
+    for lst in lists_export:
         for item in lst.get("items", []):
             item_type = item.get("type")
             external_id = item.get("externalId")
