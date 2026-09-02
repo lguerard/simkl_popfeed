@@ -1,6 +1,7 @@
 """CLI entry point for simkl-popfeed."""
 
 import argparse
+import logging
 import os
 import sys
 
@@ -9,6 +10,8 @@ from dotenv import load_dotenv
 from simkl_popfeed.config import Config, ConfigError
 from simkl_popfeed.simkl import SimklClient, wait_for_pin_approval
 from simkl_popfeed.sync import run_sync
+
+logger = logging.getLogger(__name__)
 
 
 def _run_setup(env_file: str) -> None:
@@ -73,12 +76,25 @@ def main() -> None:
         return
 
     try:
-        config = Config.from_env(env_file=args.env_file, dry_run=args.dry_run)
+        configs = Config.load_profiles(env_file=args.env_file, dry_run=args.dry_run)
     except ConfigError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    run_sync(config)
+    failed = 0
+    for config in configs:
+        if len(configs) > 1:
+            logger.info("=== Syncing profile: %s ===", config.popfeed_identifier)
+        try:
+            run_sync(config)
+        except Exception as exc:
+            failed += 1
+            logger.error(
+                "Sync failed for profile %s: %s", config.popfeed_identifier, exc
+            )
+
+    if failed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

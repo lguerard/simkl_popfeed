@@ -61,6 +61,43 @@ Only `SIMKL_CLIENT_ID` needs to be real before the next step —
 `POPFEED_IDENTIFIER`/`POPFEED_PASSWORD` can stay as placeholders until
 you're ready to actually run the sync.
 
+### Multiple people / profiles
+
+Everything in the table above configures one person's Simkl + Popfeed
+account pairing — call it profile 1. To sync more than one person in the
+same run (e.g. everyone on a shared Jellyfin server, each with their own
+Simkl and Popfeed/Bluesky accounts), add a `_2`, `_3`, ... suffix to each
+of `SIMKL_ACCESS_TOKEN`, `POPFEED_IDENTIFIER`, `POPFEED_PASSWORD`,
+`POPFEED_PDS_URL`, and the `SIMKL_POPFEED_*_LIST_NAME` overrides, one set
+per additional person:
+
+```bash
+# Profile 1 (unsuffixed, as above)
+SIMKL_ACCESS_TOKEN=alices_token
+POPFEED_IDENTIFIER=alice.bsky.social
+POPFEED_PASSWORD=alices_app_password
+
+# Profile 2
+SIMKL_ACCESS_TOKEN_2=bobs_token
+POPFEED_IDENTIFIER_2=bob.bsky.social
+POPFEED_PASSWORD_2=bobs_app_password
+```
+
+`SIMKL_CLIENT_ID` and `TMDB_API_KEY` are shared across every profile —
+one Simkl app registration and one TMDb key cover any number of people;
+only the per-user token/account variables need repeating. Get each
+person's `SIMKL_ACCESS_TOKEN_N` by running `simkl-popfeed --setup` once
+per person (each approves their own Simkl PIN).
+
+Each profile syncs independently and completely isolated from the
+others — a failure on one (e.g. a revoked token) is logged and skipped,
+the rest still run, and the process exits non-zero afterward so a CI/cron
+failure still gets noticed.
+
+A gap in the numbering (e.g. `_3` set but `_2` missing) is treated as a
+configuration error rather than silently dropping that profile, since
+it's almost always a typo.
+
 ## One-time setup: get a Simkl access token
 
 Simkl uses a PIN/device-code flow — no OAuth redirect server needed:
@@ -212,3 +249,8 @@ repository secrets/variables:
 
 No Jellyfin-reachability considerations here — this sync only ever talks
 to Popfeed, Simkl, and TMDb, all reachable from GitHub's hosted runners.
+
+For [multiple people](#multiple-people--profiles), add the equivalent
+`_2`, `_3`, ... secrets (`SIMKL_ACCESS_TOKEN_2`, `POPFEED_IDENTIFIER_2`,
+`POPFEED_PASSWORD_2`, ...) and add matching `env:` entries for them in
+the `Run sync` step of `sync.yml`, next to the existing ones.
