@@ -296,6 +296,15 @@ class SimklClient:
     def get_watched_episodes(self) -> list[SimklEpisode]:
         """Fetch every episode marked watched on Simkl.
 
+        Uses status ``all`` rather than ``completed`` — on Simkl,
+        ``completed`` means the *entire series* has been finished, so an
+        in-progress show (status ``watching``/``plantowatch``/``hold``,
+        which is most actively-watched TV) would otherwise be excluded
+        entirely. ``include_all_episodes=yes`` is also required: Simkl
+        only loads per-episode ``seasons[].episodes[]`` data by default
+        for ``watching``/``plantowatch``/``hold`` items — ``completed``
+        and ``dropped`` items return just a count unless this is set.
+
         Returns:
             list[SimklEpisode]: Watched episodes, identified by series
                 TMDb ID + season + episode number. Shows without a TMDb ID
@@ -306,8 +315,12 @@ class SimklClient:
                 jellyfin-compatible rkey scheme needs).
         """
         raw: dict = self._get(
-            "/sync/all-items/shows/completed",
-            params={"extended": "full", "episode_watched_at": "yes"},
+            "/sync/all-items/shows/all",
+            params={
+                "extended": "full",
+                "episode_watched_at": "yes",
+                "include_all_episodes": "yes",
+            },
         )
         episodes: list[SimklEpisode] = []
         for entry in raw.get("shows", []):
