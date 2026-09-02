@@ -52,6 +52,7 @@ class SimklClient:
         """
         self._client_id = client_id
         self._access_token = access_token
+        self._anime_cache: Optional[list[dict]] = None
         self._http = httpx.Client(
             base_url=SIMKL_API_URL,
             headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"},
@@ -264,7 +265,16 @@ class SimklClient:
         return response.json()
 
     def get_watched_movies(self) -> list[SimklMovie]:
-        """Fetch every movie marked completed on Simkl.
+        """Fetch every movie marked completed on Simkl, including anime movies.
+
+        Simkl keeps anime (``anime_type`` of ``movie``, ``tv``, ``ova``,
+        ``ona``, or ``special``) in its own library bucket, entirely
+        separate from ``movies``/``shows`` — a Ghibli film watched on
+        Simkl never appears under ``/sync/all-items/movies/...`` even
+        though it's a single film, not an episodic show. So on top of the
+        regular movies list, every anime entry with ``anime_type ==
+        "movie"`` is folded in here (the rest go to
+        :meth:`get_watched_episodes`).
 
         Returns:
             list[SimklMovie]: Watched movies with a TMDb ID. Entries
@@ -274,27 +284,18 @@ class SimklClient:
         raw: dict = self._get(
             "/sync/all-items/movies/completed", params={"extended": "full"}
         )
-        movies: list[SimklMovie] = []
-        for entry in raw.get("movies", []):
-            movie: dict = entry.get("movie") or {}
-            ids: dict = movie.get("ids") or {}
-            tmdb_id = _parse_int(ids.get("tmdb"))
-            if not tmdb_id:
-                logger.debug("Skipping movie without TMDb ID: %r", movie.get("title"))
-                continue
-            movies.append(
-                SimklMovie(
-                    tmdb_id=tmdb_id,
-                    imdb_id=ids.get("imdb"),
-                    title=movie.get("title", ""),
-                    watched_at=entry.get("last_watched_at"),
-                )
-            )
-        logger.info("Fetched %d watched movies from Simkl", len(movies))
+        movies = _parse_movie_entries(raw.get("movies", []), media_key="movie")
+
+        anime_movie_entries = [
+            entry for entry in self._get_watched_anime() if entry.get("anime_type") == "movie"
+        ]
+        movies += _parse_movie_entries(anime_movie_entries, media_key="show")
+
+        logger.info("Fetched %d watched movies from Simkl (incl. anime)", len(movies))
         return movies
 
     def get_watched_episodes(self) -> list[SimklEpisode]:
-        """Fetch every episode marked watched on Simkl.
+        """Fetch every episode marked watched on Simkl, including anime shows.
 
         Uses status ``all`` rather than ``completed`` — on Simkl,
         ``completed`` means the *entire series* has been finished, so an
@@ -304,6 +305,10 @@ class SimklClient:
         only loads per-episode ``seasons[].episodes[]`` data by default
         for ``watching``/``plantowatch``/``hold`` items — ``completed``
         and ``dropped`` items return just a count unless this is set.
+
+        Also folds in every anime entry that isn't ``anime_type ==
+        "movie"`` (``tv``/``ova``/``ona``/``special``) — see
+        :meth:`get_watched_movies` for why anime needs a separate fetch.
 
         Returns:
             list[SimklEpisode]: Watched episodes, identified by series
@@ -322,32 +327,37 @@ class SimklClient:
                 "include_all_episodes": "yes",
             },
         )
-        episodes: list[SimklEpisode] = []
-        for entry in raw.get("shows", []):
-            show: dict = entry.get("show") or {}
-            ids: dict = show.get("ids") or {}
-            show_tmdb_id = _parse_int(ids.get("tmdb"))
-            if not show_tmdb_id:
-                logger.debug("Skipping show without TMDb ID: %r", show.get("title"))
-                continue
-            for season in entry.get("seasons") or []:
-                season_number = season.get("number")
-                for ep in season.get("episodes") or []:
-                    number = ep.get("number")
-                    if season_number is None or number is None:
-                        continue
-                    episodes.append(
-                        SimklEpisode(
-                            show_tmdb_id=show_tmdb_id,
-                            show_imdb_id=ids.get("imdb"),
-                            show_title=show.get("title", ""),
-                            season=season_number,
-                            number=number,
-                            watched_at=ep.get("watched_at"),
-                        )
-                    )
-        logger.info("Fetched %d watched episodes from Simkl", len(episodes))
+        episodes = _parse_episode_entries(raw.get("shows", []))
+
+        anime_show_entries = [
+            entry for entry in self._get_watched_anime() if entry.get("anime_type") != "movie"
+        ]
+        episodes += _parse_episode_entries(anime_show_entries)
+
+        logger.info("Fetched %d watched episodes from Simkl (incl. anime)", len(episodes))
         return episodes
+
+    def _get_watched_anime(self) -> list[dict]:
+        """Fetch and cache every anime entry (any status, any anime_type).
+
+        Shared by :meth:`get_watched_movies` and :meth:`get_watched_episodes`
+        so a sync only issues one ``/sync/all-items/anime/...`` request
+        instead of two, per Simkl's guidance not to over-poll ``all-items``.
+
+        Returns:
+            list[dict]: Raw entries from the ``anime`` key of the response.
+        """
+        if self._anime_cache is None:
+            raw: dict = self._get(
+                "/sync/all-items/anime/all",
+                params={
+                    "extended": "full",
+                    "episode_watched_at": "yes",
+                    "include_all_episodes": "yes",
+                },
+            )
+            self._anime_cache = raw.get("anime", []) or []
+        return self._anime_cache
 
     def get_movie_ratings(self) -> dict[int, int]:
         """Fetch the user's movie ratings, keyed by TMDb ID.
@@ -519,6 +529,79 @@ def _parse_int(value: Any) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _parse_movie_entries(entries: list[dict], media_key: str) -> list[SimklMovie]:
+    """Turn ``all-items`` entries into SimklMovie objects.
+
+    Parameters:
+        entries (list[dict]): Raw entries from an ``all-items`` response
+            (either the ``movies`` key, or ``anime`` filtered to
+            ``anime_type == "movie"``).
+        media_key (str): Key holding the item's metadata within each
+            entry — ``"movie"`` for real movie entries, ``"show"`` for
+            anime entries (Simkl keys anime movies under ``show`` too).
+
+    Returns:
+        list[SimklMovie]: Movies with a resolvable TMDb ID.
+    """
+    movies: list[SimklMovie] = []
+    for entry in entries:
+        media: dict = entry.get(media_key) or {}
+        ids: dict = media.get("ids") or {}
+        tmdb_id = _parse_int(ids.get("tmdb"))
+        if not tmdb_id:
+            logger.debug("Skipping movie without TMDb ID: %r", media.get("title"))
+            continue
+        movies.append(
+            SimklMovie(
+                tmdb_id=tmdb_id,
+                imdb_id=ids.get("imdb"),
+                title=media.get("title", ""),
+                watched_at=entry.get("last_watched_at"),
+            )
+        )
+    return movies
+
+
+def _parse_episode_entries(entries: list[dict]) -> list[SimklEpisode]:
+    """Turn ``all-items`` show entries into SimklEpisode objects.
+
+    Parameters:
+        entries (list[dict]): Raw entries from an ``all-items`` response
+            (either the ``shows`` key, or ``anime`` filtered to
+            non-``movie`` ``anime_type``s — both key their metadata under
+            ``show``).
+
+    Returns:
+        list[SimklEpisode]: Episodes with a resolvable series TMDb ID and
+            season/episode number.
+    """
+    episodes: list[SimklEpisode] = []
+    for entry in entries:
+        show: dict = entry.get("show") or {}
+        ids: dict = show.get("ids") or {}
+        show_tmdb_id = _parse_int(ids.get("tmdb"))
+        if not show_tmdb_id:
+            logger.debug("Skipping show without TMDb ID: %r", show.get("title"))
+            continue
+        for season in entry.get("seasons") or []:
+            season_number = season.get("number")
+            for ep in season.get("episodes") or []:
+                number = ep.get("number")
+                if season_number is None or number is None:
+                    continue
+                episodes.append(
+                    SimklEpisode(
+                        show_tmdb_id=show_tmdb_id,
+                        show_imdb_id=ids.get("imdb"),
+                        show_title=show.get("title", ""),
+                        season=season_number,
+                        number=number,
+                        watched_at=ep.get("watched_at"),
+                    )
+                )
+    return episodes
 
 
 def wait_for_pin_approval(client: SimklClient, user_code: str, interval: int) -> str:
